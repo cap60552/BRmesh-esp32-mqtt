@@ -19,11 +19,15 @@ It's PlatformIO based, built via VSCode. Download the source and it flash to an 
 
 By default the ESP32 partitions will be too small, so I've also included the partition table layout, which can also be flashed using PlatformIO.
 
-Set your WiFi details and MQTT Broker in main.cpp before flashing.
+Set your WiFi details and MQTT Broker information in main.cpp before flashing.  For the MQTT username and password, leave the define as NULL for an anonymous authentication. otherwise enclose values in quotes.
 
 ```c
 //IP Address of your MQTT Broker (probably your Home Assistant host)
 #define MQTT_BROKER_ADDR IPAddress(192,168,0,1)
+// MQTT Username use NULL for anonymous
+#define MQTT_USERNAME NULL
+// MQTT Password use NULL for anonymous
+#define MQTT_PASSWORD NULL
 //Your WiFi SSID
 #define WIFI_SSID "YOUR_SSID"
 //Your Wifi Password
