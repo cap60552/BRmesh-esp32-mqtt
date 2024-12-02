@@ -13,16 +13,6 @@
 //////////////////////////////////////////////////////
 //CONFIGURATION
 //////////////////////////////////////////////////////
-//IP Address of your MQTT Broker (probably your Home Assistant host)
-#define MQTT_BROKER_ADDR IPAddress(192,168,0,1)
-// MQTT Username use NULL for anonymous
-#define MQTT_USERNAME NULL
-// MQTT Password use NULL for anonymous
-#define MQTT_PASSWORD NULL
-//Your WiFi SSID
-#define WIFI_SSID "YOUR_SSID"
-//Your Wifi Password
-#define WIFI_PASS "YOUR_WIFI_PASS"
 // UUID 1 128-Bit (may use linux tool uuidgen or random numbers via https://www.uuidgenerator.net/)
 #define BEACON_UUID "d45ad7fa-f3f8-4405-857a-9d485e2ea35c"
 //////////////////////////////////////////////////////
