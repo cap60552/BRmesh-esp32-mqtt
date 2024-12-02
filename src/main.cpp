@@ -4,6 +4,8 @@
 #include "BLEBeacon.h"
 #include <WiFi.h>
 #include <ArduinoHA.h>
+#include <LittleFS.h>
+#include <ArduinoJson.h>
 #include <String>
 #include <vector>
 #include <cstdio>
@@ -58,6 +60,75 @@ std::vector<LightDevice> myLights;
 char str_buffer[BUFFER_SIZE];
 BLEScan* pBLEScan;
 const int ledPin = 2;
+
+// Define structures to handle configuration options.
+struct WiFiConfig {
+    std::string ssid;
+    std::string password;
+};
+
+struct MQTTConfig {
+    std::string broker;
+    int port;
+    std::string username;
+    std::string password;
+};
+
+struct AppConfig {
+    WiFiConfig wifi;
+    MQTTConfig mqtt;
+};
+
+bool loadConfig(const char *filename, AppConfig &config) {
+    if (!LittleFS.begin(true)) {
+        Serial.printf("Failed to mount LittleFS.\n");
+        return false;
+    }
+
+    File file = LittleFS.open(filename, "r");
+    if (!file) {
+        Serial.printf("Failed to open config file.\n");
+        return false;
+    }
+
+    JsonDocument doc;; // Adjust size as needed
+    DeserializationError error = deserializeJson(doc, file);
+    if (error) {
+        Serial.printf("Failed to parse config file: %s\n", error.c_str());
+        return false;
+    }
+
+    // Load Wi-Fi Config
+    config.wifi.ssid = doc["wifi"]["ssid"] | "";
+    config.wifi.password = doc["wifi"]["password"] | "";
+
+    // Load MQTT Config
+    config.mqtt.broker = doc["mqtt"]["broker"] | "192.168.0.1";
+    config.mqtt.port = doc["mqtt"]["port"] | 1883; // Default to 1883 if not specified
+    config.mqtt.username = doc["mqtt"]["username"] | "";
+    config.mqtt.password = doc["mqtt"]["password"] | "";
+
+    file.close();
+    return true;
+}
+
+void connectToWiFi(const WiFiConfig &wifiConfig) {
+    if (wifiConfig.ssid.empty() || wifiConfig.password.empty()) {
+        Serial.printf("WiFi config is empty. Using default settings.\n");
+        return;
+    }
+
+    printf("Connecting to WiFi: %s\n", wifiConfig.ssid.c_str());
+    WiFi.begin(wifiConfig.ssid.c_str(), wifiConfig.password.c_str());
+
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.printf(".");
+    }
+
+    Serial.printf("\nWiFi connected. IP Address: %s\n", WiFi.localIP().toString().c_str());
+}
+
 
 bool doesStringMatchBytes(std::string str, const u_int8_t* bytes) {
   bool result = true;
@@ -612,10 +683,16 @@ void addLights()
 }
 
 void setup() {
+  AppConfig appConfig;  
   pinMode (ledPin, OUTPUT);
   // turn on to show we're still in setup (and are adding for lights)
   digitalWrite (ledPin, HIGH);
   Serial.begin(115200);
+
+  if (!loadConfig("/config.json", appConfig)) {
+      Serial.printf("Failed to load configuration.\n");
+      return;
+  }  
   // create new key
   uint32_t new_key = esp_random();
   my_key[0] = new_key & 0xFF;
@@ -633,11 +710,11 @@ void setup() {
   BLEDevice::init("ESP32 as iBeacon");
   pAdvertising = BLEDevice::getAdvertising();
   BLEDevice::startAdvertising();
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500); // waiting for the connection
-    Serial.println("Connecting to WiFi...");
-  }
+
+
+  // Connect to Wi-Fi
+  connectToWiFi(appConfig.wifi);
+
   // add the lights
   addLights();
   // print the added lights with their IDs
@@ -649,8 +726,9 @@ void setup() {
   }
   // finished adding lights
   digitalWrite (ledPin, LOW);
-  Serial.println("Starting MQTT");
-  mqtt->begin(MQTT_BROKER_ADDR, 1883, MQTT_USERNAME, MQTT_PASSWORD);
+  Serial.printf("Connecting to MQTT Broker: %s:%d\n", appConfig.mqtt.broker.c_str(), appConfig.mqtt.port);
+
+  mqtt->begin(appConfig.mqtt.broker.c_str(), appConfig.mqtt.port, appConfig.mqtt.username.c_str(), appConfig.mqtt.password.c_str());
   Serial.println("Ready");
 }
 
