@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ESP32 Config Portal</title>
+</head>
+<body>
+    <h1>ESP32 Configuration</h1>
+    <form method="POST" action="/save">
+        <h3>Wi-Fi Settings</h3>
+        SSID: <input type="text" name="wifi_ssid" value=""><br>
+        Password: <input type="password" name="wifi_password" value=""><br><br>
+        
+        <h3>MQTT Settings</h3>
+        Broker: <input type="text" name="mqtt_broker" value=""><br>
+        Port: <input type="number" name="mqtt_port" value="1883"><br>
+        Username: <input type="text" name="mqtt_username" value=""><br>
+        Password: <input type="password" name="mqtt_password" value=""><br><br>
+        
+        <button type="submit">Save</button>
+    </form>
+</body>
+</html>
