@@ -69,6 +69,8 @@ struct AppConfig {
     MQTTConfig mqtt;
 };
 
+AppConfig appConfig;
+
 bool loadConfig(const char *filename, AppConfig &config) {
     if (!LittleFS.begin(true)) {
         Serial.printf("Failed to mount LittleFS.\n");
@@ -672,8 +674,7 @@ void addLights()
   }
 }
 
-void setup() {
-  AppConfig appConfig;  
+void setup() {    
   pinMode (ledPin, OUTPUT);
   // turn on to show we're still in setup (and are adding for lights)
   digitalWrite (ledPin, HIGH);
@@ -716,7 +717,10 @@ void setup() {
   }
   // finished adding lights
   digitalWrite (ledPin, LOW);
+
+  Serial.println("Setting up MQTT...");
   Serial.printf("Connecting to MQTT Broker: %s:%d\n", appConfig.mqtt.broker.c_str(), appConfig.mqtt.port);
+
 
   mqtt->begin(appConfig.mqtt.broker.c_str(), appConfig.mqtt.port, appConfig.mqtt.username.c_str(), appConfig.mqtt.password.c_str());
   Serial.println("Ready");
