@@ -23,7 +23,6 @@ uint8_t my_key[4];
 byte mac[6];
 WiFiClient client;
 HADevice device;
-HAButton buttonRescan("rescanBLE");
 HAMqtt* mqtt;
 BLEAdvertising* pAdvertising;
 const uint8_t default_key[] = { 0x5e, 0x36, 0x7b, 0xc4 };
@@ -677,7 +676,8 @@ void addLights()
 
 void onButtonCommand(HAButton* sender)
 {
-    if (sender == &buttonRescan) {
+  Serial.printf("Button Press Event Recieved. ID: %s \n", sender->uniqueId());
+    if (sender->uniqueId() == "rescanBLE") {
         Serial.print("BLE Rescan requested.");
 
         addLights();
@@ -694,11 +694,6 @@ void setup() {
       Serial.printf("Failed to load configuration.\n");
       return;
   }
-
-  // Decorate rescan button
-  buttonRescan.setIcon("mdi:refresh-circle");
-  buttonRescan.setName("Rescan for Lights");
-  buttonRescan.onCommand(onButtonCommand);
 
   // create new key
   uint32_t new_key = esp_random();
@@ -718,6 +713,12 @@ void setup() {
   pAdvertising = BLEDevice::getAdvertising();
   BLEDevice::startAdvertising();
 
+  HAButton* buttonRescan = new HAButton("rescanBLE");
+
+  // Decorate rescan button
+  buttonRescan->setIcon("mdi:refresh-circle");
+  buttonRescan->setName("Rescan for Lights");
+  buttonRescan->onCommand(onButtonCommand);
 
   // Connect to Wi-Fi
   connectToWiFi(appConfig.wifi);
