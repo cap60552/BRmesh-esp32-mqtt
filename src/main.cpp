@@ -23,6 +23,7 @@ uint8_t my_key[4];
 byte mac[6];
 WiFiClient client;
 HADevice device;
+HAButton buttonRescan("rescanBLE");
 HAMqtt* mqtt;
 BLEAdvertising* pAdvertising;
 const uint8_t default_key[] = { 0x5e, 0x36, 0x7b, 0xc4 };
@@ -674,6 +675,15 @@ void addLights()
   }
 }
 
+void onButtonCommand(HAButton* sender)
+{
+    if (sender == &buttonRescan) {
+        Serial.print("BLE Rescan requested.");
+
+        addLights();
+    }
+}
+
 void setup() {    
   pinMode (ledPin, OUTPUT);
   // turn on to show we're still in setup (and are adding for lights)
@@ -683,7 +693,13 @@ void setup() {
   if (!loadConfig("/config.json", appConfig)) {
       Serial.printf("Failed to load configuration.\n");
       return;
-  }  
+  }
+
+  // Decorate rescan button
+  buttonRescan.setIcon("mdi:refresh-circle");
+  buttonRescan.setName("Rescan for Lights");
+  buttonRescan.onCommand(onButtonCommand);
+
   // create new key
   uint32_t new_key = esp_random();
   my_key[0] = new_key & 0xFF;
@@ -720,7 +736,6 @@ void setup() {
 
   Serial.println("Setting up MQTT...");
   Serial.printf("Connecting to MQTT Broker: %s:%d\n", appConfig.mqtt.broker.c_str(), appConfig.mqtt.port);
-
 
   mqtt->begin(appConfig.mqtt.broker.c_str(), appConfig.mqtt.port, appConfig.mqtt.username.c_str(), appConfig.mqtt.password.c_str());
   Serial.println("Ready");
