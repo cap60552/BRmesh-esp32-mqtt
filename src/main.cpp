@@ -6,6 +6,7 @@
 #include <ArduinoHA.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
+#include <ESPAsyncE131.h>
 #include <String>
 #include <vector>
 #include <cstdio>
@@ -25,6 +26,8 @@ WiFiClient client;
 HADevice device;
 HAMqtt* mqtt;
 BLEAdvertising* pAdvertising;
+ESPAsyncE131 e131(1);
+
 const uint8_t default_key[] = { 0x5e, 0x36, 0x7b, 0xc4 };
 struct LightType {
   std::string name;
@@ -64,10 +67,17 @@ struct MQTTConfig {
     std::string password;
 };
 
+struct E131Config {
+    int universe;
+    int universeCount;
+};
+
 struct AppConfig {
     WiFiConfig wifi;
     MQTTConfig mqtt;
+    E131Config e131;
 };
+
 
 AppConfig appConfig;
 
@@ -99,6 +109,10 @@ bool loadConfig(const char *filename, AppConfig &config) {
     config.mqtt.port = doc["mqtt"]["port"] | 1883; // Default to 1883 if not specified
     config.mqtt.username = doc["mqtt"]["username"] | "";
     config.mqtt.password = doc["mqtt"]["password"] | "";
+
+    // E1.31  Config
+    config.e131.universe = doc["e131"]["universe"] | 1;
+    config.e131.universeCount = doc["e131"]["universe_count"] | 1;
 
     file.close();
     return true;
@@ -558,7 +572,7 @@ class AddLightCallback: public BLEAdvertisedDeviceCallbacks
               }
               Serial.print(", clean manufacturer data: "); dump(cleanManufacturerData, 12);
               myLights[i].number = cleanManufacturerData[1];
-              myLights[i].id = myLights[i].device.getAddress().toString().substr(3,2) + myLights[i].device.getAddress().toString().substr(0,2);
+              myLights[i].id = "DMX_" + myLights[i].device.getAddress().toString().substr(3,2) + myLights[i].device.getAddress().toString().substr(0,2);
               myLights[i].name = "Light_" + myLights[i].id;
               // enable features based on type
               std::string typeName = "";
@@ -703,9 +717,9 @@ void setup() {
   my_key[3] = (new_key >> 24) & 0xFF;
   WiFi.macAddress(mac);
   device.setUniqueId(mac, sizeof(mac));
-  device.setName("BRMesh");
-  device.setManufacturer("BRMesh");
-  device.setModel("BRMesh");
+  device.setName("BRMeshDMX");
+  device.setManufacturer("BRMeshDMX");
+  device.setModel("BRMeshDMX");
   mqtt = new HAMqtt(client, device);
   Serial.printf("ESP32 MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
   // Create the BLE Device
@@ -735,6 +749,13 @@ void setup() {
   // finished adding lights
   digitalWrite (ledPin, LOW);
 
+  if (e131.begin(E131_MULTICAST, appConfig.e131.universe, appConfig.e131.universeCount))   // Listen via Multicast
+  {
+    Serial.println(F("Listening for e131 data..."));
+  } else {
+    Serial.println(F("*** e131.begin failed ***"));
+  }
+
   Serial.println("Setting up MQTT...");
   Serial.printf("Connecting to MQTT Broker: %s:%d\n", appConfig.mqtt.broker.c_str(), appConfig.mqtt.port);
 
@@ -744,5 +765,47 @@ void setup() {
 
 void loop()
 {
+  if (!e131.isEmpty()) {
+      e131_packet_t packet;
+      e131.pull(&packet);     // Pull packet from ring buffer
+      
+      Serial.printf("Universe %u / %u Channels | Packet#: %u / Errors: %u / CH1: %u / CH2: %u / CH3: %u / CH4: %u\n",
+              htons(packet.universe),                 // The Universe for this packet
+              htons(packet.property_value_count) - 1, // Start code is ignored, we're interested in dimmer data
+              e131.stats.num_packets,                 // Packet counter
+              e131.stats.packet_errors,               // Packet error counter
+              packet.property_values[1],              // Dimmer data for Channel 1
+              packet.property_values[2],              // Dimmer data for Channel 2
+              packet.property_values[3],              // Dimmer data for Channel 3
+              packet.property_values[4]);             // Dimmer data for Channel 4
+
+
+      for (int i = 0; i < myLights.size(); i++) {
+        if (myLights[i].isRegistered) {
+
+          Serial.printf("Light %d - ", myLights[i].number);
+          Serial.println(myLights[i].light->uniqueId());
+
+          uint8_t data[] = { 0x72, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00 };
+          data[1] = myLights[i].number;
+          data[2] = 100 & 127; // brightness
+          data[3] = packet.property_values[( i + 1 ) * 3]; // blue
+          data[4] = packet.property_values[( i + 1 ) * 1]; // red
+          data[5] = packet.property_values[( i + 1 )* 2]; // green
+
+  Serial.print("DMX Red: ");
+  Serial.println(data[4]);
+  Serial.print("DMX Green: ");
+  Serial.println(data[5]);
+  Serial.print("DMX Blue: ");
+  Serial.println(data[3]);
+
+          single_control(my_key, data);
+
+
+        }
+      }      
+
+  }  
   mqtt->loop();
 }
