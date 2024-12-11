@@ -782,7 +782,6 @@ void addLights()
 }
 
 void setup() {
-
   pinMode (ledPin, OUTPUT);
   // turn on to show we're still in setup (and are adding for lights)
   digitalWrite (ledPin, HIGH);
