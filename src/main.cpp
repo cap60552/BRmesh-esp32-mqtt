@@ -162,14 +162,16 @@ void setupConfigPortal(AppConfig &config) {
         request->send(200, "application/json", response);
     });
 
-    // Handle form submission
     server.on("/save", HTTP_POST, [&config](AsyncWebServerRequest *request) {
+        // Handle Wi-Fi settings
         if (request->hasParam("wifi_ssid", true)) {
             config.wifi.ssid = request->getParam("wifi_ssid", true)->value().c_str();
         }
         if (request->hasParam("wifi_password", true)) {
             config.wifi.password = request->getParam("wifi_password", true)->value().c_str();
         }
+
+        // Handle MQTT settings
         if (request->hasParam("mqtt_broker", true)) {
             config.mqtt.broker = request->getParam("mqtt_broker", true)->value().c_str();
         }
@@ -183,6 +185,7 @@ void setupConfigPortal(AppConfig &config) {
             config.mqtt.password = request->getParam("mqtt_password", true)->value().c_str();
         }
 
+        // Save the updated config
         if (saveConfig("/config.json", config)) {
             request->send(200, "text/plain", "Configuration Saved. Restarting...");
             Serial.println("Configuration Saved. Restarting...");
@@ -193,6 +196,7 @@ void setupConfigPortal(AppConfig &config) {
             Serial.println("Failed to save configuration");
         }
     });
+
 
     server.begin();
 }

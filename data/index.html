@@ -1,42 +1,151 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>ESP32 Config Portal</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BRmesh Config Portal</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #f9f9f9;
+            color: #333;
+        }
+        header {
+            background-color: #0078D4;
+            color: #fff;
+            padding: 1rem;
+            text-align: center;
+        }
+        main {
+            max-width: 600px;
+            margin: 1rem auto;
+            padding: 1rem;
+            background: #fff;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+        h1 {
+            font-size: 1.5rem;
+            margin-bottom: 1rem;
+        }
+        .section {
+            margin-bottom: 1.5rem;
+        }
+        .section h3 {
+            margin: 0;
+            padding: 0.5rem;
+            background: #0078D4;
+            color: #fff;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        .section-content {
+            padding: 0.5rem;
+            display: none;
+            background: #f1f1f1;
+            border-radius: 5px;
+        }
+        .section-content input {
+            width: 100%;
+            padding: 0.5rem;
+            margin: 0.5rem 0;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+        }
+        button {
+            display: block;
+            width: 100%;
+            padding: 0.75rem;
+            background: #0078D4;
+            color: #fff;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 1rem;
+        }
+        button:hover {
+            background: #005BB5;
+        }
+        @media (min-width: 600px) {
+            .section-content input {
+                max-width: calc(100% - 1rem);
+            }
+        }
+    </style>
     <script>
         async function fetchConfig() {
             try {
                 const response = await fetch('/config');
                 const data = await response.json();
 
-                // Populate form fields with the fetched config data
-                document.querySelector('input[name="wifi_ssid"]').value = data.wifi.ssid;
-                document.querySelector('input[name="wifi_password"]').value = data.wifi.password;
-                document.querySelector('input[name="mqtt_broker"]').value = data.mqtt.broker;
-                document.querySelector('input[name="mqtt_port"]').value = data.mqtt.port;
-                document.querySelector('input[name="mqtt_username"]').value = data.mqtt.username;
-                document.querySelector('input[name="mqtt_password"]').value = data.mqtt.password;
+                // Populate fields dynamically based on JSON
+                for (const [category, settings] of Object.entries(data)) {
+                    const section = document.querySelector(`[data-category="${category}"]`);
+                    if (section) {
+                        for (const [key, value] of Object.entries(settings)) {
+                            const input = section.querySelector(`[name="${category}_${key}"]`);
+                            if (input) {
+                                input.value = value;
+                            }
+                        }
+                    }
+                }
             } catch (error) {
                 console.error('Error fetching config:', error);
             }
         }
 
-        window.onload = fetchConfig;
-    </script>    
+        function toggleSection(event) {
+            const content = event.target.nextElementSibling;
+            if (content) {
+                content.style.display = content.style.display === 'none' ? 'block' : 'none';
+            }
+        }
+
+        window.onload = () => {
+            // Initialize section content display
+            document.querySelectorAll('.section-content').forEach(content => {
+                content.style.display = 'none'; // Explicitly set initial state
+            });
+
+            // Attach toggle handlers to section headers
+            document.querySelectorAll('.section h3').forEach(header => {
+                header.addEventListener('click', toggleSection);
+            });
+
+            // Fetch and populate configuration
+            fetchConfig();
+        };
+
+    </script>
 </head>
 <body>
-    <h1>ESP32 Configuration</h1>
-    <form method="POST" action="/save">
-        <h3>Wi-Fi Settings</h3>
-        SSID: <input type="text" name="wifi_ssid" value=""><br>
-        Password: <input type="password" name="wifi_password" value=""><br><br>
+    <header>
+        <h1>BRmesh Configuration Portal</h1>
+    </header>
+    <main>
+        <form method="POST" action="/save">
+            <div class="section" data-category="wifi">
+                <h3>Wi-Fi Settings</h3>
+                <div class="section-content">
+                    <label>SSID: <input type="text" name="wifi_ssid" placeholder="Enter SSID"></label>
+                    <label>Password: <input type="password" name="wifi_password" placeholder="Enter Wi-Fi Password"></label>
+                </div>
+            </div>
+            <div class="section" data-category="mqtt">
+                <h3>MQTT Settings</h3>
+                <div class="section-content">
+                    <label>Broker: <input type="text" name="mqtt_broker" placeholder="Enter MQTT Broker"></label>
+                    <label>Port: <input type="number" name="mqtt_port" placeholder="1883"></label>
+                    <label>Username: <input type="text" name="mqtt_username" placeholder="Enter MQTT Username"></label>
+                    <label>Password: <input type="password" name="mqtt_password" placeholder="Enter MQTT Password"></label>
+                </div>
+            </div>
+            <button type="submit">Save Configuration</button>
+        </form>
         
-        <h3>MQTT Settings</h3>
-        Broker: <input type="text" name="mqtt_broker" value=""><br>
-        Port: <input type="number" name="mqtt_port" value="1883"><br>
-        Username: <input type="text" name="mqtt_username" value=""><br>
-        Password: <input type="password" name="mqtt_password" value=""><br><br>
-        
-        <button type="submit">Save</button>
-    </form>
+    </main>
 </body>
 </html>
