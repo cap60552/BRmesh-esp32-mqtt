@@ -2,6 +2,26 @@
 <html>
 <head>
     <title>ESP32 Config Portal</title>
+    <script>
+        async function fetchConfig() {
+            try {
+                const response = await fetch('/config');
+                const data = await response.json();
+
+                // Populate form fields with the fetched config data
+                document.querySelector('input[name="wifi_ssid"]').value = data.wifi.ssid;
+                document.querySelector('input[name="wifi_password"]').value = data.wifi.password;
+                document.querySelector('input[name="mqtt_broker"]').value = data.mqtt.broker;
+                document.querySelector('input[name="mqtt_port"]').value = data.mqtt.port;
+                document.querySelector('input[name="mqtt_username"]').value = data.mqtt.username;
+                document.querySelector('input[name="mqtt_password"]').value = data.mqtt.password;
+            } catch (error) {
+                console.error('Error fetching config:', error);
+            }
+        }
+
+        window.onload = fetchConfig;
+    </script>    
 </head>
 <body>
     <h1>ESP32 Configuration</h1>
