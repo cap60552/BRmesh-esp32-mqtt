@@ -3,6 +3,7 @@
 #include "BLEServer.h"
 #include "BLEBeacon.h"
 #include <WiFi.h>
+#include <ESPAsyncWebServer.h>
 #include <ArduinoHA.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
@@ -24,6 +25,7 @@ byte mac[6];
 WiFiClient client;
 HADevice device;
 HAMqtt* mqtt;
+AsyncWebServer server(80);
 BLEAdvertising* pAdvertising;
 const uint8_t default_key[] = { 0x5e, 0x36, 0x7b, 0xc4 };
 struct LightType {
@@ -69,7 +71,7 @@ struct AppConfig {
     MQTTConfig mqtt;
 };
 
-AppConfig appConfig;
+AppConfig appConfig;  
 
 bool loadConfig(const char *filename, AppConfig &config) {
     if (!LittleFS.begin(true)) {
@@ -104,22 +106,127 @@ bool loadConfig(const char *filename, AppConfig &config) {
     return true;
 }
 
+// Save Configuration to LittleFS using AppConfig
+bool saveConfig(const char *filename, const AppConfig &config) {
+    File file = LittleFS.open(filename, "w");
+    if (!file) {
+        Serial.println("Failed to open config file for writing");
+        return false;
+    }
+
+    JsonDocument doc;
+    doc["wifi"]["ssid"] = config.wifi.ssid;
+    doc["wifi"]["password"] = config.wifi.password;
+    doc["mqtt"]["broker"] = config.mqtt.broker;
+    doc["mqtt"]["port"] = config.mqtt.port;
+    doc["mqtt"]["username"] = config.mqtt.username;
+    doc["mqtt"]["password"] = config.mqtt.password;
+
+    if (serializeJson(doc, file) == 0) {
+        Serial.println("Failed to write to config file");
+        file.close();
+        return false;
+    }
+
+    file.close();
+    return true;
+}
+
+void setupConfigPortal(AppConfig &config) {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("ESP32-BRmesh", "assistant123"); // AP name and password
+    Serial.println("Access Point started");
+
+    Serial.printf("Loaded Configuration: Wi-Fi SSID: %s, MQTT Broker: %s\n",
+                  config.wifi.ssid.c_str(), config.mqtt.broker.c_str());
+
+    // Serve HTML form
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(LittleFS, "/index.html", "text/html");
+    });
+
+    // Serve JSON config
+    server.on("/config", HTTP_GET, [&config](AsyncWebServerRequest *request) {
+        String response;
+        JsonDocument jsonDoc;
+    
+        // Map AppConfig to JsonDocument
+        jsonDoc["wifi"]["ssid"] = config.wifi.ssid.empty() ? "Unknown" : config.wifi.ssid.c_str();
+        jsonDoc["wifi"]["password"] = config.wifi.password.empty() ? "Unknown" : config.wifi.password.c_str();
+        jsonDoc["mqtt"]["broker"] = config.mqtt.broker.empty() ? "0.0.0.0" : config.mqtt.broker.c_str();
+        jsonDoc["mqtt"]["port"] = config.mqtt.port;
+        jsonDoc["mqtt"]["username"] = config.mqtt.username.empty() ? "guest" : config.mqtt.username.c_str();
+        jsonDoc["mqtt"]["password"] = config.mqtt.password.empty() ? "guest" : config.mqtt.password.c_str();
+
+        serializeJson(jsonDoc, response);
+        request->send(200, "application/json", response);
+    });
+
+    server.on("/save", HTTP_POST, [&config](AsyncWebServerRequest *request) {
+        // Handle Wi-Fi settings
+        if (request->hasParam("wifi_ssid", true)) {
+            config.wifi.ssid = request->getParam("wifi_ssid", true)->value().c_str();
+        }
+        if (request->hasParam("wifi_password", true)) {
+            config.wifi.password = request->getParam("wifi_password", true)->value().c_str();
+        }
+
+        // Handle MQTT settings
+        if (request->hasParam("mqtt_broker", true)) {
+            config.mqtt.broker = request->getParam("mqtt_broker", true)->value().c_str();
+        }
+        if (request->hasParam("mqtt_port", true)) {
+            config.mqtt.port = request->getParam("mqtt_port", true)->value().toInt();
+        }
+        if (request->hasParam("mqtt_username", true)) {
+            config.mqtt.username = request->getParam("mqtt_username", true)->value().c_str();
+        }
+        if (request->hasParam("mqtt_password", true)) {
+            config.mqtt.password = request->getParam("mqtt_password", true)->value().c_str();
+        }
+
+        // Save the updated config
+        if (saveConfig("/config.json", config)) {
+            request->send(200, "text/plain", "Configuration Saved. Restarting...");
+            Serial.println("Configuration Saved. Restarting...");
+            delay(1000);
+            ESP.restart(); // Restart to apply new settings
+        } else {
+            request->send(500, "text/plain", "Failed to save configuration");
+            Serial.println("Failed to save configuration");
+        }
+    });
+
+
+    server.begin();
+}
+
 void connectToWiFi(const WiFiConfig &wifiConfig) {
     if (wifiConfig.ssid.empty() || wifiConfig.password.empty()) {
-        Serial.printf("WiFi config is empty. Using default settings.\n");
+        Serial.println("Wi-Fi configuration is empty. Starting Config Portal.");
         return;
     }
 
-    printf("Connecting to WiFi: %s\n", wifiConfig.ssid.c_str());
+    Serial.printf("Connecting to Wi-Fi: %s\n", wifiConfig.ssid.c_str());
     WiFi.begin(wifiConfig.ssid.c_str(), wifiConfig.password.c_str());
 
+    unsigned long startAttemptTime = millis();
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
-        Serial.printf(".");
+        Serial.print(".");
+
+        // Timeout after 10 seconds
+        if (millis() - startAttemptTime > 10000) {
+            Serial.println("\nFailed to connect to Wi-Fi within the timeout period.");
+            break;
+        }
     }
 
-    Serial.printf("\nWiFi connected. IP Address: %s\n", WiFi.localIP().toString().c_str());
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("\nConnected to Wi-Fi! IP Address: %s\n", WiFi.localIP().toString().c_str());
+    }
 }
+
 
 
 bool doesStringMatchBytes(std::string str, const u_int8_t* bytes) {
@@ -674,59 +781,74 @@ void addLights()
   }
 }
 
-void setup() {    
+void setup() {
   pinMode (ledPin, OUTPUT);
   // turn on to show we're still in setup (and are adding for lights)
   digitalWrite (ledPin, HIGH);
   Serial.begin(115200);
 
   if (!loadConfig("/config.json", appConfig)) {
-      Serial.printf("Failed to load configuration.\n");
+      Serial.println("No valid configuration found. Starting Config Portal.");
+      setupConfigPortal(appConfig); // Launch AP mode for configuration
       return;
-  }  
-  // create new key
-  uint32_t new_key = esp_random();
-  my_key[0] = new_key & 0xFF;
-  my_key[1] = (new_key >> 8) & 0xFF;
-  my_key[2] = (new_key >> 16) & 0xFF;
-  my_key[3] = (new_key >> 24) & 0xFF;
-  WiFi.macAddress(mac);
-  device.setUniqueId(mac, sizeof(mac));
-  device.setName("BRMesh");
-  device.setManufacturer("BRMesh");
-  device.setModel("BRMesh");
-  mqtt = new HAMqtt(client, device);
-  Serial.printf("ESP32 MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
-  // Create the BLE Device
-  BLEDevice::init("ESP32 as iBeacon");
-  pAdvertising = BLEDevice::getAdvertising();
-  BLEDevice::startAdvertising();
+  } else {
+      Serial.printf("Loaded Configuration: Wi-Fi SSID: %s, MQTT Broker: %s\n",
+                    appConfig.wifi.ssid.c_str(), appConfig.mqtt.broker.c_str());
+
+      // Use the existing connectToWiFi function
+      connectToWiFi(appConfig.wifi);
+
+      if (WiFi.status() == WL_CONNECTED) {
+          Serial.println("Wi-Fi connection successful!");
+          // Initialize other features, such as MQTT
+
+          // create new key
+          uint32_t new_key = esp_random();
+          my_key[0] = new_key & 0xFF;
+          my_key[1] = (new_key >> 8) & 0xFF;
+          my_key[2] = (new_key >> 16) & 0xFF;
+          my_key[3] = (new_key >> 24) & 0xFF;
+          WiFi.macAddress(mac);
+          device.setUniqueId(mac, sizeof(mac));
+          device.setName("BRMesh");
+          device.setManufacturer("BRMesh");
+          device.setModel("BRMesh");
+          mqtt = new HAMqtt(client, device);
+          Serial.printf("ESP32 MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+          // Create the BLE Device
+          BLEDevice::init("ESP32 as iBeacon");
+          pAdvertising = BLEDevice::getAdvertising();
+          BLEDevice::startAdvertising();
 
 
-  // Connect to Wi-Fi
-  connectToWiFi(appConfig.wifi);
+          // add the lights
+          addLights();
+          // print the added lights with their IDs
+          for (int i = 0; i < myLights.size(); i++) {
+            if (myLights[i].isRegistered) {
+              Serial.printf("Light %d - ", myLights[i].number);
+              Serial.println(myLights[i].light->uniqueId());
+            }
+          }
+          // finished adding lights
+          digitalWrite (ledPin, LOW);
+          Serial.printf("Connecting to MQTT Broker: %s:%d\n", appConfig.mqtt.broker.c_str(), appConfig.mqtt.port);
 
-  // add the lights
-  addLights();
-  // print the added lights with their IDs
-  for (int i = 0; i < myLights.size(); i++) {
-    if (myLights[i].isRegistered) {
-      Serial.printf("Light %d - ", myLights[i].number);
-      Serial.println(myLights[i].light->uniqueId());
-    }
-  }
-  // finished adding lights
-  digitalWrite (ledPin, LOW);
+          mqtt->begin(appConfig.mqtt.broker.c_str(), appConfig.mqtt.port, appConfig.mqtt.username.c_str(), appConfig.mqtt.password.c_str());
+          Serial.println("Ready");    
+  
+      } else {
+          Serial.println("Wi-Fi connection failed. Starting Config Portal.");
+          setupConfigPortal(appConfig); // Fallback to AP mode
+          return;
+      }
+  } 
 
-  Serial.println("Setting up MQTT...");
-  Serial.printf("Connecting to MQTT Broker: %s:%d\n", appConfig.mqtt.broker.c_str(), appConfig.mqtt.port);
-
-
-  mqtt->begin(appConfig.mqtt.broker.c_str(), appConfig.mqtt.port, appConfig.mqtt.username.c_str(), appConfig.mqtt.password.c_str());
-  Serial.println("Ready");
 }
 
 void loop()
 {
-  mqtt->loop();
+  if (WiFi.status() == WL_CONNECTED) {  
+    mqtt->loop();
+  }
 }
