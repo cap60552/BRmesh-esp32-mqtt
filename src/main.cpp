@@ -78,6 +78,8 @@ struct AppConfig {
     E131Config e131;
 };
 
+// TODO: Figure out a way to calculate this correctly for DMX, and not assume all devices are 3 channels...
+static int channels_per_light = 4;
 
 AppConfig appConfig;
 
@@ -782,25 +784,45 @@ void loop()
 
       for (int i = 0; i < myLights.size(); i++) {
         if (myLights[i].isRegistered) {
-
           Serial.printf("Light %d - ", myLights[i].number);
           Serial.println(myLights[i].light->uniqueId());
+          int brightness = 100;
 
-          uint8_t data[] = { 0x72, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00 };
-          data[1] = myLights[i].number;
-          data[2] = 100 & 127; // brightness
-          data[3] = packet.property_values[( i + 1 ) * 3]; // blue
-          data[4] = packet.property_values[( i + 1 ) * 1]; // red
-          data[5] = packet.property_values[( i + 1 )* 2]; // green
+          if (
+              packet.property_values[(i * channels_per_light) + 1] +
+              packet.property_values[(i * channels_per_light) + 2] +
+              packet.property_values[(i * channels_per_light) + 3] == 0
+          ) {
+            // turn off light
+              Serial.println("Turn Off");
+              uint8_t data[] = { 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+              data[1] = myLights[i].number;
+              single_control(my_key, data);
+          }
+          else {
+            // Turn on light and
+            // Set light to a color...
 
-  Serial.print("DMX Red: ");
-  Serial.println(data[4]);
-  Serial.print("DMX Green: ");
-  Serial.println(data[5]);
-  Serial.print("DMX Blue: ");
-  Serial.println(data[3]);
+            uint8_t data[] = { 0x72, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00 };
+            data[1] = myLights[i].number;
+            data[2] = brightness & 127; // brightness
+            data[3] = packet.property_values[( i * channels_per_light ) + 3]; // blue
+            data[4] = packet.property_values[( i * channels_per_light ) + 1]; // red
+            data[5] = packet.property_values[( i * channels_per_light ) + 2]; // green
 
-          single_control(my_key, data);
+            Serial.print("DMX Red: ");
+            Serial.println(data[4]);
+            Serial.print("DMX Green: ");
+            Serial.println(data[5]);
+            Serial.print("DMX Blue: ");
+            Serial.println(data[3]);
+            Serial.print("DMX White: ");
+            Serial.println(data[6]);
+            single_control(my_key, data);
+          }
+
+
+          
 
 
         }
