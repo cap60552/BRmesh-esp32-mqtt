@@ -768,66 +768,60 @@ void setup() {
 void loop()
 {
   if (!e131.isEmpty()) {
-      e131_packet_t packet;
-      e131.pull(&packet);     // Pull packet from ring buffer
-      
-      Serial.printf("Universe %u / %u Channels | Packet#: %u / Errors: %u / CH1: %u / CH2: %u / CH3: %u / CH4: %u\n",
-              htons(packet.universe),                 // The Universe for this packet
-              htons(packet.property_value_count) - 1, // Start code is ignored, we're interested in dimmer data
-              e131.stats.num_packets,                 // Packet counter
-              e131.stats.packet_errors,               // Packet error counter
-              packet.property_values[1],              // Dimmer data for Channel 1
-              packet.property_values[2],              // Dimmer data for Channel 2
-              packet.property_values[3],              // Dimmer data for Channel 3
-              packet.property_values[4]);             // Dimmer data for Channel 4
+    e131_packet_t packet;
+    e131.pull(&packet);     // Pull packet from ring buffer
+    
+    Serial.printf("Universe %u / %u Channels | Packet#: %u / Errors: %u / CH1: %u / CH2: %u / CH3: %u / CH4: %u\n",
+            htons(packet.universe),                 // The Universe for this packet
+            htons(packet.property_value_count) - 1, // Start code is ignored, we're interested in dimmer data
+            e131.stats.num_packets,                 // Packet counter
+            e131.stats.packet_errors,               // Packet error counter
+            packet.property_values[1],              // Dimmer data for Channel 1
+            packet.property_values[2],              // Dimmer data for Channel 2
+            packet.property_values[3],              // Dimmer data for Channel 3
+            packet.property_values[4]);             // Dimmer data for Channel 4
 
 
-      for (int i = 0; i < myLights.size(); i++) {
-        if (myLights[i].isRegistered) {
-          Serial.printf("Light %d - ", myLights[i].number);
-          Serial.println(myLights[i].light->uniqueId());
-          int brightness = 100;
+    for (int i = 0; i < myLights.size(); i++) {
+      if (myLights[i].isRegistered) {
+        Serial.printf("Light %d - ", myLights[i].number);
+        Serial.println(myLights[i].light->uniqueId());
+        int brightness = 100;
 
-          if (
-              packet.property_values[(i * channels_per_light) + 1] +
-              packet.property_values[(i * channels_per_light) + 2] +
-              packet.property_values[(i * channels_per_light) + 3] == 0
-          ) {
-            // turn off light
-              Serial.println("Turn Off");
-              uint8_t data[] = { 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-              data[1] = myLights[i].number;
-              single_control(my_key, data);
-          }
-          else {
-            // Turn on light and
-            // Set light to a color...
-
-            uint8_t data[] = { 0x72, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00 };
+        if (
+            packet.property_values[(i * channels_per_light) + 1] +
+            packet.property_values[(i * channels_per_light) + 2] +
+            packet.property_values[(i * channels_per_light) + 3] == 0
+        ) {
+          // turn off light
+            Serial.println("Turn Off");
+            uint8_t data[] = { 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
             data[1] = myLights[i].number;
-            data[2] = brightness & 127; // brightness
-            data[3] = packet.property_values[( i * channels_per_light ) + 3]; // blue
-            data[4] = packet.property_values[( i * channels_per_light ) + 1]; // red
-            data[5] = packet.property_values[( i * channels_per_light ) + 2]; // green
-
-            Serial.print("DMX Red: ");
-            Serial.println(data[4]);
-            Serial.print("DMX Green: ");
-            Serial.println(data[5]);
-            Serial.print("DMX Blue: ");
-            Serial.println(data[3]);
-            Serial.print("DMX White: ");
-            Serial.println(data[6]);
             single_control(my_key, data);
-          }
-
-
-          
-
-
         }
-      }      
+        else {
+          // Turn on light and
+          // Set light to a color...
 
+          uint8_t data[] = { 0x72, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00 };
+          data[1] = myLights[i].number;
+          data[2] = brightness & 127; // brightness
+          data[3] = packet.property_values[( i * channels_per_light ) + 3]; // blue
+          data[4] = packet.property_values[( i * channels_per_light ) + 1]; // red
+          data[5] = packet.property_values[( i * channels_per_light ) + 2]; // green
+
+          Serial.print("DMX Red: ");
+          Serial.println(data[4]);
+          Serial.print("DMX Green: ");
+          Serial.println(data[5]);
+          Serial.print("DMX Blue: ");
+          Serial.println(data[3]);
+          Serial.print("DMX White: ");
+          Serial.println(data[6]);
+          single_control(my_key, data);
+        }
+      }
+    }      
   }  
   mqtt->loop();
 }
