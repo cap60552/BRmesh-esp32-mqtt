@@ -3,22 +3,31 @@
 #include "BLEServer.h"
 #include "BLEBeacon.h"
 #include <WiFi.h>
-#include <ArduinoHA.h>
+#include <Preferences.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
-#include <ESPAsyncE131.h>
+#include <ArduinoHA.h>
 #include <String>
 #include <vector>
 #include <cstdio>
 
 //////////////////////////////////////////////////////
-//CONFIGURATION
+// CONFIGURATION
+// WiFi and MQTT settings are read at boot from /config.json on LittleFS.
+// Edit data/config.json, then run PlatformIO "Upload Filesystem Image".
 //////////////////////////////////////////////////////
-// UUID 1 128-Bit (may use linux tool uuidgen or random numbers via https://www.uuidgenerator.net/)
-#define BEACON_UUID "d45ad7fa-f3f8-4405-857a-9d485e2ea35c"
-//////////////////////////////////////////////////////
-//END
-//////////////////////////////////////////////////////
+#define CONFIG_PATH "/config.json"
+
+struct Config {
+  std::string wifiSsid;
+  std::string wifiPassword;
+  std::string mqttBroker;      // IP address or hostname
+  uint16_t mqttPort = 1883;
+  std::string mqttUsername;    // empty = no auth
+  std::string mqttPassword;
+};
+// Global so the strings live forever: ArduinoHA keeps pointers to them.
+Config config;
 
 uint8_t my_key[4];
 byte mac[6];
@@ -26,8 +35,6 @@ WiFiClient client;
 HADevice device;
 HAMqtt* mqtt;
 BLEAdvertising* pAdvertising;
-ESPAsyncE131 e131(1);
-
 const uint8_t default_key[] = { 0x5e, 0x36, 0x7b, 0xc4 };
 struct LightType {
   std::string name;
@@ -38,110 +45,44 @@ std::vector<LightType> lightTypes = {
   {"RGBW" , {0xa1, 0xa8}}, // 43169 - A8A1 - RGBW light
   {"RGB"  , {0xa0, 0xa8}}, // 43168 - A8A0 - RGB light
 };
-#define BLESCAN_DURATION 5
+#define BLESCAN_DURATION 5     // seconds to look for unpaired lights at boot
+#define PAIR_ATTEMPTS 5        // how many times to retry sending the key to a light
+#define PAIR_SCAN_SECONDS 2    // how long to listen for the light's reply each attempt
+#define COMMAND_ADVERTISE_MS 500 // how long each on/off/colour command is broadcast
 struct LightDevice {
   BLEAdvertisedDevice device;
-  uint8_t type[2];
+  bool hasBleAddr = false;     // seen over BLE during this boot's scan
+  bool fromStorage = false;    // loaded from flash (paired on an earlier boot)
+  uint8_t lightMac[6] = {0};   // light's own MAC from its advertisement (stable, unique)
+  uint8_t type[2] = {0};
   bool isRegistered = false;
   std::string id;
-  HALight* light;
+  HALight* light = nullptr;
   std::string name;
+  uint8_t number = 0;
+  // the bridge's own record of what it last told the light
+  uint8_t brightness = 127;    // 1..127
+  bool isOn = false;
+  bool hasColor = false;       // false = plain white mode (0x22 commands)
+  uint8_t colorData[5] = {0};  // bytes 3..7 of the 0x72 command: B, R, G, temp lo, temp hi
+};
+struct StoredLight {
+  uint8_t mac[6];
+  uint8_t type[2];
   uint8_t number;
 };
+Preferences prefs;
 std::vector<LightDevice> myLights;
 #define BUFFER_SIZE 200
 char str_buffer[BUFFER_SIZE];
 BLEScan* pBLEScan;
 const int ledPin = 2;
-
-// Define structures to handle configuration options.
-struct WiFiConfig {
-    std::string ssid;
-    std::string password;
-};
-
-struct MQTTConfig {
-    std::string broker;
-    int port;
-    std::string username;
-    std::string password;
-};
-
-struct E131Config {
-    int universe;
-    int universeCount;
-};
-
-struct AppConfig {
-    WiFiConfig wifi;
-    MQTTConfig mqtt;
-    E131Config e131;
-};
-
-// TODO: Figure out a way to calculate this correctly for DMX, and not assume all devices are 3 channels...
-static int channels_per_light = 4;
-
-AppConfig appConfig;
-
-bool loadConfig(const char *filename, AppConfig &config) {
-    if (!LittleFS.begin(true)) {
-        Serial.printf("Failed to mount LittleFS.\n");
-        return false;
-    }
-
-    File file = LittleFS.open(filename, "r");
-    if (!file) {
-        Serial.printf("Failed to open config file.\n");
-        return false;
-    }
-
-    JsonDocument doc;; // Adjust size as needed
-    DeserializationError error = deserializeJson(doc, file);
-    if (error) {
-        Serial.printf("Failed to parse config file: %s\n", error.c_str());
-        return false;
-    }
-
-    // Load Wi-Fi Config
-    config.wifi.ssid = doc["wifi"]["ssid"] | "";
-    config.wifi.password = doc["wifi"]["password"] | "";
-
-    // Load MQTT Config
-    config.mqtt.broker = doc["mqtt"]["broker"] | "192.168.0.1";
-    config.mqtt.port = doc["mqtt"]["port"] | 1883; // Default to 1883 if not specified
-    config.mqtt.username = doc["mqtt"]["username"] | "";
-    config.mqtt.password = doc["mqtt"]["password"] | "";
-
-    // E1.31  Config
-    config.e131.universe = doc["e131"]["universe"] | 1;
-    config.e131.universeCount = doc["e131"]["universe_count"] | 1;
-
-    file.close();
-    return true;
-}
-
-void connectToWiFi(const WiFiConfig &wifiConfig) {
-    if (wifiConfig.ssid.empty() || wifiConfig.password.empty()) {
-        Serial.printf("WiFi config is empty. Using default settings.\n");
-        return;
-    }
-
-    printf("Connecting to WiFi: %s\n", wifiConfig.ssid.c_str());
-    WiFi.begin(wifiConfig.ssid.c_str(), wifiConfig.password.c_str());
-
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.printf(".");
-    }
-
-    Serial.printf("\nWiFi connected. IP Address: %s\n", WiFi.localIP().toString().c_str());
-}
-
+const int resetPin = 0; // BOOT button on most ESP32 dev boards
 
 bool doesStringMatchBytes(std::string str, const u_int8_t* bytes) {
   bool result = true;
   for (int i = 0; i < str.length(); i++) {
-    if (str[i] != bytes[i]) {
+    if ((uint8_t)str[i] != bytes[i]) {
       result = false;
       break;
     }
@@ -395,433 +336,527 @@ void single_control(const uint8_t* key, const uint8_t* data)
   pAdvertising->setMinInterval(50);
   pAdvertising->setMaxInterval(50);
   pAdvertising->start();
-  delay(250);
+  delay(COMMAND_ADVERTISE_MS);
   pAdvertising->stop();
+  free(rfPayload);
   Serial.println("");
 }
 
-LightDevice getLight(std::string id)
+//////////////////////////////////////////////////////
+// LIGHT STORAGE / LOOKUP
+//////////////////////////////////////////////////////
+
+// Find a light by its Home Assistant unique ID. Returns nullptr instead of
+// throwing (an uncaught throw reboots the ESP32).
+LightDevice* findLight(const char* id)
 {
-  for (int i = 0; i < myLights.size(); i++) {
-    if (myLights[i].id == id) return myLights[i];
+  for (size_t i = 0; i < myLights.size(); i++) {
+    if (myLights[i].id == id) return &myLights[i];
   }
-  throw std::runtime_error("Light not found");
+  return nullptr;
+}
+
+std::string macToId(const uint8_t* m)
+{
+  char buf[13];
+  snprintf(buf, sizeof(buf), "%02x%02x%02x%02x%02x%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
+  return std::string(buf);
+}
+
+void saveLights()
+{
+  prefs.begin("brmesh", false);
+  uint8_t count = 0;
+  for (size_t i = 0; i < myLights.size(); i++) {
+    if (!myLights[i].isRegistered) continue;
+    StoredLight s;
+    memcpy(s.mac, myLights[i].lightMac, 6);
+    s.type[0] = myLights[i].type[0];
+    s.type[1] = myLights[i].type[1];
+    s.number = myLights[i].number;
+    char k[8];
+    snprintf(k, sizeof(k), "l%u", count);
+    prefs.putBytes(k, &s, sizeof(s));
+    count++;
+  }
+  prefs.putUChar("count", count);
+  prefs.end();
+  Serial.printf("Saved %u light(s) to flash\n", count);
+}
+
+void loadLights()
+{
+  prefs.begin("brmesh", true);
+  uint8_t count = prefs.getUChar("count", 0);
+  for (uint8_t i = 0; i < count; i++) {
+    char k[8];
+    snprintf(k, sizeof(k), "l%u", i);
+    StoredLight s;
+    if (prefs.getBytes(k, &s, sizeof(s)) != sizeof(s)) continue;
+    LightDevice light;
+    memcpy(light.lightMac, s.mac, 6);
+    light.type[0] = s.type[0];
+    light.type[1] = s.type[1];
+    light.number = s.number;
+    light.isRegistered = true;
+    light.fromStorage = true;
+    myLights.push_back(light);
+    Serial.printf("Loaded light %u, MAC %s\n", s.number, macToId(s.mac).c_str());
+  }
+  prefs.end();
+}
+
+void loadOrCreateKey()
+{
+  prefs.begin("brmesh", false);
+  if (prefs.getBytes("key", my_key, 4) != 4) {
+    uint32_t new_key = esp_random();
+    my_key[0] = new_key & 0xFF;
+    my_key[1] = (new_key >> 8) & 0xFF;
+    my_key[2] = (new_key >> 16) & 0xFF;
+    my_key[3] = (new_key >> 24) & 0xFF;
+    prefs.putBytes("key", my_key, 4);
+    Serial.print("Created and saved new mesh key: ");
+  } else {
+    Serial.print("Loaded mesh key from flash: ");
+  }
+  dump(my_key, 4); Serial.print("\n");
+  prefs.end();
+}
+
+void clearStorage()
+{
+  prefs.begin("brmesh", false);
+  prefs.clear();
+  prefs.end();
+  Serial.println("Cleared stored key and lights");
+}
+
+//////////////////////////////////////////////////////
+// HOME ASSISTANT CALLBACKS
+//////////////////////////////////////////////////////
+
+// Send the "colour" command (0x72) using the bridge's own record of this
+// light's brightness and last colour / colour temperature.
+void sendColor(LightDevice* light)
+{
+  uint8_t data[] = { 0x72, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+  data[1] = light->number;
+  data[2] = light->brightness & 127;
+  memcpy(data + 3, light->colorData, 5);
+  single_control(my_key, data);
 }
 
 void onStateCommand(bool state, HALight* sender)
 {
-  Serial.print("Light: ");
-  Serial.println(sender->getName());
-  Serial.print("ID: ");
-  Serial.println(sender->uniqueId());
-  Serial.print("State: ");
-  Serial.println(state);
-  LightDevice light = getLight(sender->uniqueId());
+  LightDevice* light = findLight(sender->uniqueId());
+  if (!light) { Serial.printf("Unknown light %s\n", sender->uniqueId()); return; }
+  Serial.printf("Light %s (#%u) state: %d\n", sender->uniqueId(), light->number, state);
+  // Home Assistant re-sends "ON" along with every colour/brightness change.
+  // Skip it when the light is already on so it can't interfere with the colour.
+  if (state && light->isOn) {
+    Serial.println("  already on, not resending");
+    sender->setState(state);
+    return;
+  }
   uint8_t data[] = { 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-  data[1] = light.number;
+  data[1] = light->number;
   if (state) data[2] = 0x80;
   single_control(my_key, data);
+  light->isOn = state;
   sender->setState(state); // report state back to the Home Assistant
 }
 
 void onBrightnessCommand(uint8_t brightness, HALight* sender)
 {
-  Serial.print("Light: ");
-  Serial.println(sender->getName());
-  Serial.print("ID: ");
-  Serial.println(sender->uniqueId());
-  Serial.print("Brightness: ");
-  Serial.println(brightness);
-  LightDevice light = getLight(sender->uniqueId());
-  uint8_t data[] = { 0x22, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00 };
-  data[1] = light.number;
-  data[2] = brightness & 127;
-  single_control(my_key, data);
+  LightDevice* light = findLight(sender->uniqueId());
+  if (!light) { Serial.printf("Unknown light %s\n", sender->uniqueId()); return; }
+  Serial.printf("Light %s (#%u) brightness: %u\n", sender->uniqueId(), light->number, brightness);
+  light->brightness = brightness & 127;
+  if (light->brightness == 0) light->brightness = 1;
+  if (light->hasColor) {
+    // keep the current colour, just change its brightness
+    sendColor(light);
+  } else {
+    uint8_t data[] = { 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    data[1] = light->number;
+    data[2] = light->brightness;
+    single_control(my_key, data);
+  }
+  light->isOn = true;
   sender->setBrightness(brightness); // report brightness back to the Home Assistant
 }
 
 void onColorTemperatureCommand(uint16_t temperature, HALight* sender)
 {
-  Serial.print("Light: ");
-  Serial.println(sender->getName());
-  Serial.print("ID: ");
-  Serial.println(sender->uniqueId());
-  Serial.print("Color temperature: ");
-  Serial.println(temperature);
-  LightDevice light = getLight(sender->uniqueId());
-  uint8_t data[] = { 0x72, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00 };
-  data[1] = light.number;
-  data[2] = sender->getCurrentBrightness() & 127;
-  data[6] = temperature & 127;
-  data[7] = (temperature >> 8) & 127;
-  single_control(my_key, data);
+  LightDevice* light = findLight(sender->uniqueId());
+  if (!light) { Serial.printf("Unknown light %s\n", sender->uniqueId()); return; }
+  Serial.printf("Light %s (#%u) color temp: %u\n", sender->uniqueId(), light->number, temperature);
+  memset(light->colorData, 0, 5);
+  light->colorData[3] = temperature & 127;
+  light->colorData[4] = (temperature >> 8) & 127;
+  light->hasColor = true;
+  sendColor(light);
+  light->isOn = true;
   sender->setColorTemperature(temperature); // report color temperature back to the Home Assistant
 }
 
 void onRGBColorCommand(HALight::RGBColor color, HALight* sender)
 {
-  Serial.print("Light: ");
-  Serial.println(sender->getName());
-  Serial.print("ID: ");
-  Serial.println(sender->uniqueId());
-  Serial.print("Red: ");
-  Serial.println(color.red);
-  Serial.print("Green: ");
-  Serial.println(color.green);
-  Serial.print("Blue: ");
-  Serial.println(color.blue);
-  LightDevice light = getLight(sender->uniqueId());
-  uint8_t data[] = { 0x72, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00 };
-  data[1] = light.number;
-  data[2] = sender->getCurrentBrightness() & 127;
-  data[3] = color.blue;
-  data[4] = color.red;
-  data[5] = color.green;
-  single_control(my_key, data);
+  LightDevice* light = findLight(sender->uniqueId());
+  if (!light) { Serial.printf("Unknown light %s\n", sender->uniqueId()); return; }
+  Serial.printf("Light %s (#%u) RGB: %u,%u,%u at brightness %u\n", sender->uniqueId(), light->number,
+    color.red, color.green, color.blue, light->brightness);
+  memset(light->colorData, 0, 5);
+  light->colorData[0] = color.blue;
+  light->colorData[1] = color.red;
+  light->colorData[2] = color.green;
+  light->hasColor = true;
+  sendColor(light);
+  light->isOn = true;
   sender->setRGBColor(color); // report color back to the Home Assistant
 }
+
+// Create the Home Assistant entity for a light. The ID/name strings are
+// strdup'd so the pointers ArduinoHA keeps stay valid forever (ArduinoHA does
+// not copy them, and std::string storage inside a std::vector can move).
+void createHALight(LightDevice& l)
+{
+  l.id = "brmesh_" + macToId(l.lightMac);
+  l.name = "BRMesh Light " + std::to_string(l.number);
+  const char* idPtr = strdup(l.id.c_str());
+  const char* namePtr = strdup(l.name.c_str());
+
+  std::string typeName = "";
+  for (size_t j = 0; j < lightTypes.size(); j++) {
+    if (l.type[0] == lightTypes[j].code[0] && l.type[1] == lightTypes[j].code[1]) {
+      typeName = lightTypes[j].name;
+      break;
+    }
+  }
+  HALight* light;
+  if (typeName == "RGBW") {
+    light = new HALight(idPtr, HALight::BrightnessFeature | HALight::ColorTemperatureFeature | HALight::RGBFeature);
+    light->onBrightnessCommand(onBrightnessCommand);
+    light->onColorTemperatureCommand(onColorTemperatureCommand);
+    light->onRGBColorCommand(onRGBColorCommand);
+    light->setBrightnessScale(127);
+    light->setCurrentBrightness(127);
+  } else if (typeName == "RGB") {
+    light = new HALight(idPtr, HALight::BrightnessFeature | HALight::RGBFeature);
+    light->onBrightnessCommand(onBrightnessCommand);
+    light->onRGBColorCommand(onRGBColorCommand);
+    light->setBrightnessScale(127);
+    light->setCurrentBrightness(127);
+  } else {
+    // "Smart" - no additional features
+    light = new HALight(idPtr);
+  }
+  light->setName(namePtr);
+  light->onStateCommand(onStateCommand);
+  l.light = light;
+  Serial.printf("Created HA light %s (mesh #%u, %s)\n", idPtr, l.number, typeName.c_str());
+}
+
+//////////////////////////////////////////////////////
+// DISCOVERY / PAIRING
+//////////////////////////////////////////////////////
 
 class AddDeviceCallback: public BLEAdvertisedDeviceCallbacks
 {
   void onResult(BLEAdvertisedDevice foundDevice)
   {
-    std::string address = foundDevice.getAddress().toString();
-    std::string name = foundDevice.getName();
     std::string mData = foundDevice.getManufacturerData();
-    int rssi = foundDevice.getRSSI();
-    Serial.print("BLE Device found -> Address: ");
-    Serial.print(address.c_str());
-    Serial.print(", Name: ");
-    Serial.print(name.c_str());
-    Serial.print(", RSSI: ");
-    Serial.print(rssi);
-    Serial.print(", Manufacturer Data: ");
-    dump(mData);
-    // check the device is a light, and using the default key
-    // check response
-    if (mData.size() == 18) {
-      std::string type = mData.substr(12,2);
-      std::string key = mData.substr(14,4);
-      bool knownType = false;
-      for (int i = 0; i < lightTypes.size(); i++) {
-        if (doesStringMatchBytes(type, lightTypes[i].code)) {
-          Serial.printf(", It's a %s light!", lightTypes[i].name.c_str());
-          knownType = true;
-          break;
+    if (mData.size() != 18) return;
+    std::string type = mData.substr(12, 2);
+    std::string key = mData.substr(14, 4);
+    bool knownType = false;
+    for (size_t i = 0; i < lightTypes.size(); i++) {
+      if (doesStringMatchBytes(type, lightTypes[i].code)) { knownType = true; break; }
+    }
+    if (!knownType || !doesStringMatchBytes(key, default_key)) return;
+
+    uint8_t lmac[6];
+    for (int i = 0; i < 6; i++) lmac[i] = (uint8_t)mData[6 + i];
+
+    Serial.printf("Found unpaired light: BLE %s, MAC %s, RSSI %d\n",
+      foundDevice.getAddress().toString().c_str(), macToId(lmac).c_str(), foundDevice.getRSSI());
+
+    for (size_t i = 0; i < myLights.size(); i++) {
+      // already seen in this scan, or a stored light that was factory reset
+      if (memcmp(myLights[i].lightMac, lmac, 6) == 0) {
+        if (myLights[i].fromStorage && !myLights[i].hasBleAddr) {
+          Serial.println("  -> this light is stored but was reset, will re-pair it");
+          myLights[i].device = foundDevice;
+          myLights[i].hasBleAddr = true;
+          myLights[i].isRegistered = false; // needs the key again
         }
-      }
-      if (knownType && doesStringMatchBytes(key, default_key)) {
-        Serial.print(", Using the default key!");
-        bool alreadyKnown = false;
-        for (int i = 0; i < myLights.size(); i++) {
-          if (myLights[i].device.getAddress().toString() == foundDevice.getAddress().toString()) {
-            // we already know about this device, so ignore it
-            alreadyKnown = true;
-            break;
-          }
-        }
-        if (alreadyKnown == false) {
-          Serial.print(", Stored it!");
-          LightDevice light;
-          light.device = foundDevice;
-          light.type[0] = type[0];
-          light.type[1] = type[1];
-          myLights.push_back(light);
-        }
+        return;
       }
     }
-    Serial.println("");
+    LightDevice light;
+    light.device = foundDevice;
+    light.hasBleAddr = true;
+    memcpy(light.lightMac, lmac, 6);
+    light.type[0] = type[0];
+    light.type[1] = type[1];
+    myLights.push_back(light);
   }
 };
+
+// index into myLights of the light currently being paired
+int pairingIndex = -1;
+uint8_t pairingNumber = 0;
 
 class AddLightCallback: public BLEAdvertisedDeviceCallbacks
 {
   void onResult(BLEAdvertisedDevice foundDevice)
   {
-    std::string address = foundDevice.getAddress().toString();
-    std::string name = foundDevice.getName();
+    if (pairingIndex < 0) return;
+    LightDevice& l = myLights[pairingIndex];
+    if (l.isRegistered) return;
+    if (!foundDevice.getAddress().equals(l.device.getAddress())) return;
+
+    // Copy into a real buffer. The original code took .c_str() of a temporary
+    // std::string here, which is a dangling pointer -> random light numbers.
     std::string mData = foundDevice.getManufacturerData();
-    int rssi = foundDevice.getRSSI();
-    Serial.print("BLE Device found -> Address: ");
-    Serial.print(address.c_str());
-    Serial.print(", Name: ");
-    Serial.print(name.c_str());
-    Serial.print(", RSSI: ");
-    Serial.print(rssi);
-    Serial.print(", Manufacturer Data: ");
-    dump(mData);
-    // check response
-    if (mData.size() == 18) {
-      for (int i = 0; i < myLights.size(); i++) {
-        if (myLights[i].device.getAddress().toString() == foundDevice.getAddress().toString()) {
-          Serial.print(", It's one of our lights!");
-          // check it's not using the default key
-          std::string key = mData.substr(14,4);
-          if (doesStringMatchBytes(key, default_key)) {
-            Serial.print(", still using the default key (ignore)");
-          } else {
-            Serial.print(", with the new key");
-            if (myLights[i].isRegistered) {
-              Serial.print(", but it's already registered!");
-            } else {
-              myLights[i].isRegistered = true;
-              // get the light number from the light itself
-              uint8_t cleanManufacturerData[12];
-              uint8_t* manufacturerData = (uint8_t*)foundDevice.getManufacturerData().substr(2).c_str();
-              // use the key to clean it
-              for (int j = 0; j < 12; j++) {
-                cleanManufacturerData[j] = my_key[j & 3] ^ manufacturerData[4 + j];
-              }
-              Serial.print(", clean manufacturer data: "); dump(cleanManufacturerData, 12);
-              myLights[i].number = cleanManufacturerData[1];
-              myLights[i].id = "DMX_" + myLights[i].device.getAddress().toString().substr(3,2) + myLights[i].device.getAddress().toString().substr(0,2);
-              myLights[i].name = "Light_" + myLights[i].id;
-              // enable features based on type
-              std::string typeName = "";
-              for (int j = 0; j < lightTypes.size(); j++) {
-                if (myLights[i].type[0] == lightTypes[j].code[0] && myLights[i].type[1] == lightTypes[j].code[1]) {
-                  typeName = lightTypes[j].name;
-                  break;
-                }
-              }
-              // create the HA object
-              if (typeName == "RGBW") {
-                HALight* light = new HALight(myLights[i].id.c_str(), HALight::BrightnessFeature | HALight::ColorTemperatureFeature | HALight::RGBFeature);
-                light->setName(myLights[i].name.c_str());
-                light->onStateCommand(onStateCommand);
-                light->onBrightnessCommand(onBrightnessCommand);
-                light->onColorTemperatureCommand(onColorTemperatureCommand);
-                light->onRGBColorCommand(onRGBColorCommand);
-                light->setBrightnessScale(127);
-                light->setBrightness(127);
-                myLights[i].light = light;
-              } else if (typeName == "RGB") {
-                HALight* light = new HALight(myLights[i].id.c_str(), HALight::BrightnessFeature | HALight::RGBFeature);
-                light->setName(myLights[i].name.c_str());
-                light->onStateCommand(onStateCommand);
-                light->onBrightnessCommand(onBrightnessCommand);
-                light->onRGBColorCommand(onRGBColorCommand);
-                light->setBrightnessScale(127);
-                light->setBrightness(127);
-                myLights[i].light = light;
-              } else {
-                // "Smart" - no additional features
-                HALight* light = new HALight(myLights[i].id.c_str());
-                light->setName(myLights[i].name.c_str());
-                light->onStateCommand(onStateCommand);
-                myLights[i].light = light;
-              }
-              Serial.printf(", created light ");
-              Serial.printf(myLights[i].light->uniqueId());
-            }
-            Serial.println("");
-          }
-          break;
-        }
-      }
+    if (mData.size() != 18) return;
+    std::string key = mData.substr(14, 4);
+    if (doesStringMatchBytes(key, default_key)) return; // not taken the new key yet
+
+    uint8_t clean[12];
+    for (int j = 0; j < 12; j++) clean[j] = my_key[j & 3] ^ (uint8_t)mData[6 + j];
+    Serial.print("  Light accepted new key, decoded data: "); dump(clean, 12); Serial.print("\n");
+    if (clean[1] != pairingNumber) {
+      Serial.printf("  NOTE: light reported number %u, we requested %u (using requested)\n", clean[1], pairingNumber);
     }
-    Serial.println("");
+    l.number = pairingNumber;
+    l.isRegistered = true;
   }
 };
 
+AddDeviceCallback addDeviceCallback;
+AddLightCallback addLightCallback;
+
+uint8_t nextFreeNumber()
+{
+  uint8_t n = 1;
+  bool used = true;
+  while (used && n < 250) {
+    used = false;
+    for (size_t i = 0; i < myLights.size(); i++) {
+      if ((myLights[i].isRegistered || myLights[i].fromStorage) && myLights[i].number == n) { used = true; n++; break; }
+    }
+  }
+  return n;
+}
+
 void scan()
 {
-  Serial.println("Send wake command");
+  Serial.println("Send wake command, scanning for unpaired lights");
   uint8_t data[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
   const uint8_t key[] = { 0x00, 0x00, 0x00, 0x00 };
   uint8_t* rfPayload = 0;
   uint8_t rfPayloadLength = do_generate_command(0, data, 6, key, false, true, 0, rfPayload);
   std::string serviceData = getServiceData(rfPayloadLength, rfPayload);
+  free(rfPayload);
   BLEAdvertisementData oAdvertisementData = BLEAdvertisementData();
   oAdvertisementData.setFlags(0x04); // BR_EDR_NOT_SUPPORTED 0x04
   oAdvertisementData.addData(serviceData);
   pAdvertising->setAdvertisementData(oAdvertisementData);
+  pAdvertising->setMinInterval(50);
+  pAdvertising->setMaxInterval(50);
   pAdvertising->start();
-  Serial.println("Scan for lights");
-  pBLEScan = BLEDevice::getScan();
-  pBLEScan->setAdvertisedDeviceCallbacks(new AddDeviceCallback());
-  pBLEScan->setInterval(500);
-  pBLEScan->setWindow(500);
+  pBLEScan->setAdvertisedDeviceCallbacks(&addDeviceCallback, true /* want duplicates */);
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);
   pBLEScan->setActiveScan(true);
   pBLEScan->start(BLESCAN_DURATION, false);
+  pBLEScan->clearResults();
   pAdvertising->stop();
 }
 
-void addLight(uint8_t lightNumber, LightDevice light)
+bool pairLight(int index, uint8_t lightNumber)
 {
+  LightDevice& light = myLights[index];
+  std::string mData = light.device.getManufacturerData();
+  Serial.printf("Pairing light MAC %s as #%u\n", macToId(light.lightMac).c_str(), lightNumber);
+
   uint8_t data[12];
-  std::string lightMac = light.device.getManufacturerData().substr(6, 6);
-  Serial.printf("Setting key on light %d, MAC: ", lightNumber); dump(lightMac); Serial.print("\n");
-  Serial.print("new key: "); dump(my_key, 4); Serial.print("\n");
-  for (int i = 0; i < 6; i++) data[i] = (uint8_t)lightMac[i]; // mac address
+  memcpy(data, light.lightMac, 6); // mac address
   data[6] = lightNumber; // light id - we're requesting that it's set to this
   data[7] = 0x01; // group id
   data[8] = my_key[0];
   data[9] = my_key[1];
   data[10] = my_key[2];
   data[11] = my_key[3];
-  uint8_t* rfPayload = 0;
-  uint8_t rfPayloadLength = do_generate_command(2, data, 12, default_key, false, true, 0, rfPayload);
-  std::string serviceData = getServiceData(rfPayloadLength, rfPayload);
-  BLEAdvertisementData oAdvertisementData = BLEAdvertisementData();
-  oAdvertisementData.setFlags(0x04);
-  oAdvertisementData.addData(serviceData);
-  pAdvertising->setAdvertisementData(oAdvertisementData);
-  pAdvertising->setMinInterval(50);
-  pAdvertising->setMaxInterval(50);
-  pAdvertising->start();
-  // get light response
-  pBLEScan = BLEDevice::getScan();
-  pBLEScan->setAdvertisedDeviceCallbacks(new AddLightCallback());
-  pBLEScan->setInterval(50);
-  pBLEScan->setWindow(50);
+
+  pairingIndex = index;
+  pairingNumber = lightNumber;
+  pBLEScan->setAdvertisedDeviceCallbacks(&addLightCallback, true /* want duplicates */);
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);
   pBLEScan->setActiveScan(true);
-  pBLEScan->start(1);
-  pAdvertising->stop();
+
+  for (int attempt = 1; attempt <= PAIR_ATTEMPTS && !light.isRegistered; attempt++) {
+    Serial.printf("  attempt %d/%d\n", attempt, PAIR_ATTEMPTS);
+    uint8_t* rfPayload = 0;
+    uint8_t rfPayloadLength = do_generate_command(2, data, 12, default_key, false, true, 0, rfPayload);
+    std::string serviceData = getServiceData(rfPayloadLength, rfPayload);
+    free(rfPayload);
+    BLEAdvertisementData oAdvertisementData = BLEAdvertisementData();
+    oAdvertisementData.setFlags(0x04);
+    oAdvertisementData.addData(serviceData);
+    pAdvertising->setAdvertisementData(oAdvertisementData);
+    pAdvertising->setMinInterval(50);
+    pAdvertising->setMaxInterval(50);
+    pAdvertising->start();
+    pBLEScan->start(PAIR_SCAN_SECONDS, false);
+    pBLEScan->clearResults();
+    pAdvertising->stop();
+    if (!light.isRegistered) delay(300);
+  }
+  pairingIndex = -1;
+  if (!light.isRegistered) Serial.println("  FAILED to pair this light (power-cycle it and reboot the ESP32 to retry)");
+  return light.isRegistered;
 }
 
-void addLights()
+void addNewLights()
 {
   scan();
   // wait before adding lights, as they seem to need a brief pause after the scan
   delay(1000);
-  for (int i = 0; i < myLights.size(); i++) {
-    addLight(i + 1, myLights[i]);
+  bool changed = false;
+  for (size_t i = 0; i < myLights.size(); i++) {
+    if (myLights[i].isRegistered || !myLights[i].hasBleAddr) continue;
+    // keep the old number for a stored light that was reset, so HA entity stays the same
+    uint8_t n = (myLights[i].fromStorage && myLights[i].number != 0) ? myLights[i].number : nextFreeNumber();
+    if (pairLight(i, n)) changed = true;
+    delay(500);
   }
+  // drop lights we saw but failed to pair (unless they're stored ones)
+  for (int i = (int)myLights.size() - 1; i >= 0; i--) {
+    if (!myLights[i].isRegistered && !myLights[i].fromStorage) myLights.erase(myLights.begin() + i);
+  }
+  if (changed) saveLights();
 }
 
-void onButtonCommand(HAButton* sender)
+//////////////////////////////////////////////////////
+// CONFIG FILE
+//////////////////////////////////////////////////////
+
+bool loadConfig()
 {
-  Serial.printf("Button Press Event Recieved. ID: %s \n", sender->uniqueId());
-    if (sender->uniqueId() == "rescanBLE") {
-        Serial.print("BLE Rescan requested.");
-
-        addLights();
-    }
-}
-
-void setup() {    
-  pinMode (ledPin, OUTPUT);
-  // turn on to show we're still in setup (and are adding for lights)
-  digitalWrite (ledPin, HIGH);
-  Serial.begin(115200);
-
-  if (!loadConfig("/config.json", appConfig)) {
-      Serial.printf("Failed to load configuration.\n");
-      return;
+  if (!LittleFS.begin(false)) {
+    Serial.println("ERROR: could not mount LittleFS. Did you run 'Upload Filesystem Image'?");
+    return false;
+  }
+  File f = LittleFS.open(CONFIG_PATH, "r");
+  if (!f) {
+    Serial.println("ERROR: " CONFIG_PATH " not found on LittleFS");
+    return false;
+  }
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err) {
+    Serial.printf("ERROR: could not parse " CONFIG_PATH ": %s\n", err.c_str());
+    return false;
   }
 
-  // create new key
-  uint32_t new_key = esp_random();
-  my_key[0] = new_key & 0xFF;
-  my_key[1] = (new_key >> 8) & 0xFF;
-  my_key[2] = (new_key >> 16) & 0xFF;
-  my_key[3] = (new_key >> 24) & 0xFF;
+  config.wifiSsid     = doc["wifi"]["ssid"]     | "";
+  config.wifiPassword = doc["wifi"]["password"] | "";
+  config.mqttBroker   = doc["mqtt"]["broker"]   | "";
+  config.mqttPort     = doc["mqtt"]["port"]     | 1883;
+  config.mqttUsername = doc["mqtt"]["username"] | "";
+  config.mqttPassword = doc["mqtt"]["password"] | "";
+
+  if (config.wifiSsid.empty() || config.mqttBroker.empty()) {
+    Serial.println("ERROR: config.json needs at least wifi.ssid and mqtt.broker");
+    return false;
+  }
+  Serial.printf("Config loaded: WiFi '%s', MQTT %s:%u, user '%s'\n",
+    config.wifiSsid.c_str(), config.mqttBroker.c_str(), config.mqttPort,
+    config.mqttUsername.c_str());
+  return true;
+}
+
+// No usable config: blink the LED fast forever so it's obvious.
+void haltWithError()
+{
+  while (true) {
+    digitalWrite(ledPin, HIGH); delay(100);
+    digitalWrite(ledPin, LOW);  delay(100);
+  }
+}
+
+//////////////////////////////////////////////////////
+// SETUP / LOOP
+//////////////////////////////////////////////////////
+
+void setup() {
+  pinMode(ledPin, OUTPUT);
+  pinMode(resetPin, INPUT_PULLUP);
+  // turn on to show we're still in setup (and are adding lights)
+  digitalWrite(ledPin, HIGH);
+  Serial.begin(115200);
+  delay(200);
+
+  // Hold the BOOT button while powering on to forget the key + all lights
+  if (digitalRead(resetPin) == LOW) clearStorage();
+
+  if (!loadConfig()) haltWithError();
+
+  myLights.reserve(32);
+  loadOrCreateKey();
+  loadLights();
+
+  // start sequence numbers somewhere random so the lights don't ignore our
+  // first commands after a reboot as "already seen"
+  SEND_COUNT = esp_random() & 0xFF;
+
   WiFi.macAddress(mac);
   device.setUniqueId(mac, sizeof(mac));
-  device.setName("BRMeshDMX");
-  device.setManufacturer("BRMeshDMX");
-  device.setModel("BRMeshDMX");
-  mqtt = new HAMqtt(client, device);
+  device.setName("BRMesh");
+  device.setManufacturer("BRMesh");
+  device.setModel("BRMesh");
+  mqtt = new HAMqtt(client, device, 32);
   Serial.printf("ESP32 MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
-  // Create the BLE Device
-  BLEDevice::init("ESP32 as iBeacon");
+
+  BLEDevice::init("BRMesh bridge");
   pAdvertising = BLEDevice::getAdvertising();
-  BLEDevice::startAdvertising();
+  pBLEScan = BLEDevice::getScan();
 
-  HAButton* buttonRescan = new HAButton("rescanBLE");
-
-  // Decorate rescan button
-  buttonRescan->setIcon("mdi:refresh-circle");
-  buttonRescan->setName("Rescan for Lights");
-  buttonRescan->onCommand(onButtonCommand);
-
-  // Connect to Wi-Fi
-  connectToWiFi(appConfig.wifi);
-
-  // add the lights
-  addLights();
-  // print the added lights with their IDs
-  for (int i = 0; i < myLights.size(); i++) {
-    if (myLights[i].isRegistered) {
-      Serial.printf("Light %d - ", myLights[i].number);
-      Serial.println(myLights[i].light->uniqueId());
-    }
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(config.wifiSsid.c_str(), config.wifiPassword.c_str());
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500); // waiting for the connection
+    Serial.println("Connecting to WiFi...");
   }
-  // finished adding lights
-  digitalWrite (ledPin, LOW);
 
-  if (e131.begin(E131_MULTICAST, appConfig.e131.universe, appConfig.e131.universeCount))   // Listen via Multicast
-  {
-    Serial.println(F("Listening for e131 data..."));
+  // pair any lights that are on the default (factory) key
+  addNewLights();
+
+  // create HA entities for every known light (stored + newly paired)
+  for (size_t i = 0; i < myLights.size(); i++) {
+    if (myLights[i].isRegistered || myLights[i].fromStorage) createHALight(myLights[i]);
+  }
+
+  digitalWrite(ledPin, LOW);
+  Serial.println("Starting MQTT");
+  IPAddress brokerIp;
+  if (brokerIp.fromString(config.mqttBroker.c_str())) {
+    if (config.mqttUsername.empty()) mqtt->begin(brokerIp, config.mqttPort);
+    else mqtt->begin(brokerIp, config.mqttPort, config.mqttUsername.c_str(), config.mqttPassword.c_str());
   } else {
-    Serial.println(F("*** e131.begin failed ***"));
+    // not an IP, treat it as a hostname
+    if (config.mqttUsername.empty()) mqtt->begin(config.mqttBroker.c_str(), config.mqttPort);
+    else mqtt->begin(config.mqttBroker.c_str(), config.mqttPort, config.mqttUsername.c_str(), config.mqttPassword.c_str());
   }
-
-  Serial.println("Setting up MQTT...");
-  Serial.printf("Connecting to MQTT Broker: %s:%d\n", appConfig.mqtt.broker.c_str(), appConfig.mqtt.port);
-
-  mqtt->begin(appConfig.mqtt.broker.c_str(), appConfig.mqtt.port, appConfig.mqtt.username.c_str(), appConfig.mqtt.password.c_str());
   Serial.println("Ready");
 }
 
 void loop()
 {
-  if (!e131.isEmpty()) {
-    e131_packet_t packet;
-    e131.pull(&packet);     // Pull packet from ring buffer
-    
-    Serial.printf("Universe %u / %u Channels | Packet#: %u / Errors: %u / CH1: %u / CH2: %u / CH3: %u / CH4: %u\n",
-            htons(packet.universe),                 // The Universe for this packet
-            htons(packet.property_value_count) - 1, // Start code is ignored, we're interested in dimmer data
-            e131.stats.num_packets,                 // Packet counter
-            e131.stats.packet_errors,               // Packet error counter
-            packet.property_values[1],              // Dimmer data for Channel 1
-            packet.property_values[2],              // Dimmer data for Channel 2
-            packet.property_values[3],              // Dimmer data for Channel 3
-            packet.property_values[4]);             // Dimmer data for Channel 4
-
-
-    for (int i = 0; i < myLights.size(); i++) {
-      if (myLights[i].isRegistered) {
-        Serial.printf("Light %d - ", myLights[i].number);
-        Serial.println(myLights[i].light->uniqueId());
-        int brightness = 100;
-
-        if (
-            packet.property_values[(i * channels_per_light) + 1] +
-            packet.property_values[(i * channels_per_light) + 2] +
-            packet.property_values[(i * channels_per_light) + 3] == 0
-        ) {
-          // turn off light
-            Serial.println("Turn Off");
-            uint8_t data[] = { 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-            data[1] = myLights[i].number;
-            single_control(my_key, data);
-        }
-        else {
-          // Turn on light and
-          // Set light to a color...
-
-          uint8_t data[] = { 0x72, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00 };
-          data[1] = myLights[i].number;
-          data[2] = brightness & 127; // brightness
-          data[3] = packet.property_values[( i * channels_per_light ) + 3]; // blue
-          data[4] = packet.property_values[( i * channels_per_light ) + 1]; // red
-          data[5] = packet.property_values[( i * channels_per_light ) + 2]; // green
-
-          Serial.print("DMX Red: ");
-          Serial.println(data[4]);
-          Serial.print("DMX Green: ");
-          Serial.println(data[5]);
-          Serial.print("DMX Blue: ");
-          Serial.println(data[3]);
-          Serial.print("DMX White: ");
-          Serial.println(data[6]);
-          single_control(my_key, data);
-        }
-      }
-    }      
-  }  
   mqtt->loop();
 }
