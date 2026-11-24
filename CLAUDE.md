@@ -33,6 +33,9 @@ also on the network.
    Paired lights (MAC, type, number) are saved there too, so reboots don't need re-pairing.
 3. It scans for lights still on the factory default key `5E367BC4` and pairs each one
    (sends it our key plus a mesh number from 1 up), retrying up to `PAIR_ATTEMPTS`.
+   The HA button "Rescan for Lights" (`brmesh_rescan`) runs the same scan while running. It sets
+   a flag that `loop()` picks up, and if new lights were added it reconnects MQTT, because ArduinoHA
+   only publishes discovery configs when it connects.
 4. One HA light entity per light, unique ID `brmesh_<light MAC>`.
 5. Commands are 8-byte payloads broadcast for `COMMAND_ADVERTISE_MS` (500 ms):
    - `22 <num> <b> 00 00 00 00 00`: on/off/brightness. b=0x80 means on, 0 means off, 1-127 is brightness

@@ -49,6 +49,7 @@ std::vector<LightType> lightTypes = {
 #define PAIR_ATTEMPTS 5        // how many times to retry sending the key to a light
 #define PAIR_SCAN_SECONDS 2    // how long to listen for the light's reply each attempt
 #define COMMAND_ADVERTISE_MS 500 // how long each on/off/colour command is broadcast
+#define MAX_LIGHTS 31          // HAMqtt has 32 entity slots; one is the rescan button
 struct LightDevice {
   BLEAdvertisedDevice device;
   bool hasBleAddr = false;     // seen over BLE during this boot's scan
@@ -78,6 +79,10 @@ char str_buffer[BUFFER_SIZE];
 BLEScan* pBLEScan;
 const int ledPin = 2;
 const int resetPin = 0; // BOOT button on most ESP32 dev boards
+HAButton* rescanButton = nullptr;
+// set by the HA button callback, handled in loop() so the long BLE scan
+// doesn't run inside the MQTT message handler
+volatile bool rescanRequested = false;
 
 bool doesStringMatchBytes(std::string str, const u_int8_t* bytes) {
   bool result = true;
@@ -594,6 +599,10 @@ class AddDeviceCallback: public BLEAdvertisedDeviceCallbacks
         return;
       }
     }
+    if (myLights.size() >= MAX_LIGHTS) {
+      Serial.println("  -> too many lights, ignoring this one");
+      return;
+    }
     LightDevice light;
     light.device = foundDevice;
     light.hasBleAddr = true;
@@ -717,7 +726,7 @@ bool pairLight(int index, uint8_t lightNumber)
     if (!light.isRegistered) delay(300);
   }
   pairingIndex = -1;
-  if (!light.isRegistered) Serial.println("  FAILED to pair this light (power-cycle it and reboot the ESP32 to retry)");
+  if (!light.isRegistered) Serial.println("  FAILED to pair this light (power-cycle it, then press 'Rescan for Lights' in HA or reboot the ESP32)");
   return light.isRegistered;
 }
 
@@ -739,6 +748,58 @@ void addNewLights()
     if (!myLights[i].isRegistered && !myLights[i].fromStorage) myLights.erase(myLights.begin() + i);
   }
   if (changed) saveLights();
+}
+
+// Create HA entities for known lights that don't have one yet.
+// Returns how many were created.
+int createMissingHALights()
+{
+  int created = 0;
+  for (size_t i = 0; i < myLights.size(); i++) {
+    LightDevice& l = myLights[i];
+    if (l.light == nullptr && (l.isRegistered || l.fromStorage)) {
+      createHALight(l);
+      created++;
+    }
+  }
+  return created;
+}
+
+void startMqtt()
+{
+  IPAddress brokerIp;
+  if (brokerIp.fromString(config.mqttBroker.c_str())) {
+    if (config.mqttUsername.empty()) mqtt->begin(brokerIp, config.mqttPort);
+    else mqtt->begin(brokerIp, config.mqttPort, config.mqttUsername.c_str(), config.mqttPassword.c_str());
+  } else {
+    // not an IP, treat it as a hostname
+    if (config.mqttUsername.empty()) mqtt->begin(config.mqttBroker.c_str(), config.mqttPort);
+    else mqtt->begin(config.mqttBroker.c_str(), config.mqttPort, config.mqttUsername.c_str(), config.mqttPassword.c_str());
+  }
+}
+
+void onRescanCommand(HAButton* sender)
+{
+  Serial.println("Rescan requested from Home Assistant");
+  rescanRequested = true;
+}
+
+// Look for new (factory-key) lights while running, pair them and add them to HA.
+void rescanForLights()
+{
+  digitalWrite(ledPin, HIGH);
+  addNewLights();
+  int created = createMissingHALights();
+  if (created > 0) {
+    // ArduinoHA only publishes discovery configs and subscribes to command
+    // topics when it connects, so reconnect to announce the new lights.
+    Serial.printf("Added %d new light(s), reconnecting MQTT so HA sees them\n", created);
+    mqtt->disconnect();
+    startMqtt();
+  } else {
+    Serial.println("Rescan done, no new lights");
+  }
+  digitalWrite(ledPin, LOW);
 }
 
 //////////////////////////////////////////////////////
@@ -838,25 +899,24 @@ void setup() {
   addNewLights();
 
   // create HA entities for every known light (stored + newly paired)
-  for (size_t i = 0; i < myLights.size(); i++) {
-    if (myLights[i].isRegistered || myLights[i].fromStorage) createHALight(myLights[i]);
-  }
+  createMissingHALights();
+
+  rescanButton = new HAButton("brmesh_rescan");
+  rescanButton->setName("Rescan for Lights");
+  rescanButton->setIcon("mdi:refresh-circle");
+  rescanButton->onCommand(onRescanCommand);
 
   digitalWrite(ledPin, LOW);
   Serial.println("Starting MQTT");
-  IPAddress brokerIp;
-  if (brokerIp.fromString(config.mqttBroker.c_str())) {
-    if (config.mqttUsername.empty()) mqtt->begin(brokerIp, config.mqttPort);
-    else mqtt->begin(brokerIp, config.mqttPort, config.mqttUsername.c_str(), config.mqttPassword.c_str());
-  } else {
-    // not an IP, treat it as a hostname
-    if (config.mqttUsername.empty()) mqtt->begin(config.mqttBroker.c_str(), config.mqttPort);
-    else mqtt->begin(config.mqttBroker.c_str(), config.mqttPort, config.mqttUsername.c_str(), config.mqttPassword.c_str());
-  }
+  startMqtt();
   Serial.println("Ready");
 }
 
 void loop()
 {
   mqtt->loop();
+  if (rescanRequested) {
+    rescanRequested = false;
+    rescanForLights();
+  }
 }
