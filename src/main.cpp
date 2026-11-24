@@ -447,9 +447,21 @@ void sendColor(LightDevice* light)
 {
   uint8_t data[] = { 0x72, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
   data[1] = light->number;
-  data[2] = light->brightness & 127;
+  // 0x80 = "on" bit, as in the ESPHome fastcon component (scross01/esphome-fastcon)
+  data[2] = 0x80 | (light->brightness & 127);
   memcpy(data + 3, light->colorData, 5);
   single_control(my_key, data);
+}
+
+// LEDs are linear but eyes aren't, so a mix like (255,180,180) looks almost
+// white. Gamma-correcting each channel keeps mixed colours saturated.
+// Set COLOR_GAMMA to 1.0 to send HA's values unchanged.
+#define COLOR_GAMMA 2.2f
+uint8_t gammaCorrect(uint8_t v)
+{
+  if (v == 0 || v == 255) return v;
+  uint8_t out = (uint8_t)(powf(v / 255.0f, COLOR_GAMMA) * 255.0f + 0.5f);
+  return out == 0 ? 1 : out; // don't drop a channel HA asked for entirely
 }
 
 void onStateCommand(bool state, HALight* sender)
@@ -513,9 +525,9 @@ void onRGBColorCommand(HALight::RGBColor color, HALight* sender)
   Serial.printf("Light %s (#%u) RGB: %u,%u,%u at brightness %u\n", sender->uniqueId(), light->number,
     color.red, color.green, color.blue, light->brightness);
   memset(light->colorData, 0, 5);
-  light->colorData[0] = color.blue;
-  light->colorData[1] = color.red;
-  light->colorData[2] = color.green;
+  light->colorData[0] = gammaCorrect(color.blue);
+  light->colorData[1] = gammaCorrect(color.red);
+  light->colorData[2] = gammaCorrect(color.green);
   light->hasColor = true;
   sendColor(light);
   light->isOn = true;
@@ -912,9 +924,39 @@ void setup() {
   Serial.println("Ready");
 }
 
+// Debug: type "raw 72 01 FF 00 00 FF 00 00" in the serial monitor to send
+// those 8 bytes as a light command (hex). Up to 8 bytes; missing ones are 0.
+void handleSerialCommand()
+{
+  static String line;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c != '\n' && c != '\r') { line += c; continue; }
+    line.trim();
+    if (line.startsWith("raw ")) {
+      uint8_t data[8] = {0};
+      int n = 0;
+      const char* p = line.c_str() + 4;
+      char* end;
+      while (n < 8) {
+        long v = strtol(p, &end, 16);
+        if (end == p) break;
+        data[n++] = (uint8_t)v;
+        p = end;
+      }
+      Serial.print("Sending raw: "); dump(data, 8); Serial.print("\n");
+      single_control(my_key, data);
+    } else if (line.length() > 0) {
+      Serial.println("Unknown command. Usage: raw 72 <num> <bright> <B> <R> <G> <W1> <W2>");
+    }
+    line = "";
+  }
+}
+
 void loop()
 {
   mqtt->loop();
+  handleSerialCommand();
   if (rescanRequested) {
     rescanRequested = false;
     rescanForLights();

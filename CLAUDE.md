@@ -39,7 +39,11 @@ also on the network.
 4. One HA light entity per light, unique ID `brmesh_<light MAC>`.
 5. Commands are 8-byte payloads broadcast for `COMMAND_ADVERTISE_MS` (500 ms):
    - `22 <num> <b> 00 00 00 00 00`: on/off/brightness. b=0x80 means on, 0 means off, 1-127 is brightness
-   - `72 <num> <bright> <B> <R> <G> <ctLo> <ctHi>`: colour / colour temperature
+   - `72 <num> <0x80|bright> <B> <R> <G> <ctLo> <ctHi>`: colour / colour temperature. The 0x80 bit
+     matches scross01/esphome-fastcon. RGB is gamma-corrected (`COLOR_GAMMA`, 2.2; set 1.0 to
+     disable). "Washed out" colours turned out to be HA's colour wheel sending pale values (e.g.
+     100,255,100), not a firmware bug; exact RGB values from HA render correctly.
+   - Debug: typing `raw <hex bytes>` in the serial monitor sends up to 8 raw command bytes.
 
 ## Changes made vs the original (and why)
 
